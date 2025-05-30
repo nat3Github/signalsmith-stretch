@@ -1,0 +1,19 @@
+.{
+    .fingerprint = 0x9bdcfc73c3ced9f0,
+    .name = .signalsmith_stretch,
+    .version = "0.0.0",
+    .dependencies = .{
+        .signalsmith_linear = .{
+            .url = "git+https://github.com/nat3Github/signalsmith-linear#dbbcf96a697d89037e10e6347ae321e77a107c61",
+            .hash = "signalsmith_linear-0.0.0-cK1dXwk6AgAceFaTuEIhL_4FKSjCTC3d0AWxsrXhweE7",
+        },
+    },
+    .paths = .{
+        "build.zig.zon",
+        "build.zig",
+        "zig-src",
+        "LICENSE.txt",
+        "c_api",
+        "signalsmith-stretch.h",
+    },
+}
