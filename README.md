@@ -149,7 +149,7 @@ The algorithm has a lot of number-crunching, so Debug builds are much slower (up
 
 ### Dependencies and `#define`s
 
-This uses the [Signalsmith Linear](https://github.com/Signalsmith-Audio/linear) library for FFTs and other speedups.  There are [flags]([Linear repo](https://github.com/Signalsmith-Audio/linear?tab=readme-ov-file#building)) to enable Accelerate (`SIGNALSMITH_USE_ACCELERATE`) or IPP (`SIGNALSMITH_USE_IPP`).
+This uses the [Signalsmith Linear](https://github.com/Signalsmith-Audio/linear) library for FFTs and other speedups.  There are [flags]([Linear repo](https://github.com/Signalsmith-Audio/linear?tab=readme-ov-file#building)) to use faster FFT implementations (`SIGNALSMITH_USE_ACCELERATE`/`SIGNALSMITH_USE_IPP`/`SIGNALSMITH_USE_PFFFT`/`SIGNALSMITH_USE_PFFFT_DOUBLE`), and corresponding CMake options.
 
 ## License
 
@@ -157,7 +157,7 @@ Released under the [MIT License](LICENSE.txt) - get in touch if you need anythin
 
 ## Other environments / languages
 
-There's a Web Audio release in [`web/`](web/) (WASM/AudioWorklet), also available on [NPM](npmjs.com/package/signalsmith-stretch).  This has its own (higher-level) API, but the stretching algorithm will remain in-sync with the C++ library.
+There's a Web Audio release in [`web/`](web/) (WASM/AudioWorklet), also available on [NPM](https://npmjs.com/package/signalsmith-stretch).  This has its own (higher-level) API, but the stretching algorithm will remain in-sync with the C++ library.
 
 There's a [Python binding](https://pypi.org/project/python-stretch/) written/published by [Gregorio Andrea Giudici](https://github.com/gregogiudici/python-stretch).  This is used as the default pitch/time method in [Audiomentations](https://iver56.github.io/audiomentations/).
 

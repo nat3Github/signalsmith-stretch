@@ -33,17 +33,12 @@ namespace _impl {
 
 template<typename Sample=float, class RandomEngine=void>
 struct SignalsmithStretch {
-	static constexpr size_t version[3] = {1, 3, 1};
+	static constexpr size_t version[3] = {1, 3, 2};
 
 	SignalsmithStretch() : randomEngine(std::random_device{}()) {}
 	SignalsmithStretch(long seed) : randomEngine(seed) {}
-	
-	int blockSamples() const {
-		return int(stft.blockSamples());
-	}
-	int intervalSamples() const {
-		return int(stft.defaultInterval());
-	}
+		
+	// The difference between the internal position (centre of a block) and the input samples you're supplying
 	int inputLatency() const {
 		return int(stft.analysisLatency());
 	}
@@ -57,7 +52,7 @@ struct SignalsmithStretch {
 		stashedOutput = stft.output;
 		
 		prevInputOffset = -1;
-		channelBands.assign(channelBands.size(), Band());
+		_channelBands.assign(_channelBands.size(), Band());
 		silenceCounter = 0;
 		didSeek = false;
 		blockProcess = {};
@@ -66,10 +61,10 @@ struct SignalsmithStretch {
 
 	// Configures using a default preset
 	void presetDefault(int nChannels, Sample sampleRate, bool splitComputation=false) {
-		configure(nChannels, sampleRate*0.12, sampleRate*0.03, splitComputation);
+		configure(nChannels, static_cast<int>(sampleRate*0.12), static_cast<int>(sampleRate*0.03), splitComputation);
 	}
 	void presetCheaper(int nChannels, Sample sampleRate, bool splitComputation=true) {
-		configure(nChannels, sampleRate*0.1, sampleRate*0.04, splitComputation);
+		configure(nChannels, static_cast<int>(sampleRate*0.1), static_cast<int>(sampleRate*0.04), splitComputation);
 	}
 
 	// Manual setup
@@ -78,13 +73,12 @@ struct SignalsmithStretch {
 		channels = nChannels;
 		stft.configure(channels, channels, blockSamples, intervalSamples + 1);
 		stft.setInterval(intervalSamples, stft.kaiser);
-		stft.reset(0.1);
+		stft.reset(Sample(0.1));
 		stashedInput = stft.input;
 		stashedOutput = stft.output;
-		tmpBuffer.resize(blockSamples + intervalSamples);
 
 		bands = int(stft.bands());
-		channelBands.assign(bands*channels, Band());
+		_channelBands.assign(bands*channels, Band());
 		
 		peaks.reserve(bands/2);
 		energy.resize(bands);
@@ -94,6 +88,19 @@ struct SignalsmithStretch {
 
 		blockProcess = {};
 		formantMetric.resize(bands + 2);
+
+		tmpProcessBuffer.resize(blockSamples + intervalSamples);
+		tmpPreRollBuffer.resize(outputLatency()*channels);
+	}
+	// For querying the existing config
+	int blockSamples() const {
+		return int(stft.blockSamples());
+	}
+	int intervalSamples() const {
+		return int(stft.defaultInterval());
+	}
+	bool splitComputation() const {
+		return _splitComputation;
 	}
 
 	/// Frequency multiplier, and optional tonality limit (as multiple of sample-rate)
@@ -126,15 +133,16 @@ struct SignalsmithStretch {
 	void setFormantBase(Sample baseFreq=0) {
 		formantBaseFreq = baseFreq;
 	}
-
-	// Provide previous input ("pre-roll"), without affecting the speed calculation.  You should ideally feed it one block-length + one interval
+	
+	// Provide previous input ("pre-roll") to smoothly change the input location without interrupting the output.  This doesn't do any calculation, just copies intput to a buffer.
+	// You should ideally feed it `seekLength()` frames of input, unless it's directly after a `.reset()` (in which case `.outputSeek()` might be a better choice)
 	template<class Inputs>
 	void seek(Inputs &&inputs, int inputSamples, double playbackRate) {
-		tmpBuffer.resize(0);
-		tmpBuffer.resize(stft.blockSamples() + stft.defaultInterval());
+		tmpProcessBuffer.resize(0);
+		tmpProcessBuffer.resize(stft.blockSamples() + stft.defaultInterval());
 
-		int startIndex = std::max<int>(0, inputSamples - int(tmpBuffer.size())); // start position in input
-		int padStart = int(tmpBuffer.size() + startIndex) - inputSamples; // start position in tmpBuffer
+		int startIndex = std::max<int>(0, inputSamples - int(tmpProcessBuffer.size())); // start position in input
+		int padStart = int(tmpProcessBuffer.size() + startIndex) - inputSamples; // start position in tmpProcessBuffer
 
 		Sample totalEnergy = 0;
 		for (int c = 0; c < channels; ++c) {
@@ -142,12 +150,12 @@ struct SignalsmithStretch {
 			for (int i = startIndex; i < inputSamples; ++i) {
 				Sample s = inputChannel[i];
 				totalEnergy += s*s;
-				tmpBuffer[i - startIndex + padStart] = s;
+				tmpProcessBuffer[i - startIndex + padStart] = s;
 			}
 			
-			stft.writeInput(c, tmpBuffer.size(), tmpBuffer.data());
+			stft.writeInput(c, tmpProcessBuffer.size(), tmpProcessBuffer.data());
 		}
-		stft.moveInput(tmpBuffer.size());
+		stft.moveInput(tmpProcessBuffer.size());
 		if (totalEnergy >= noiseFloor) {
 			silenceCounter = 0;
 			silenceFirst = true;
@@ -155,7 +163,49 @@ struct SignalsmithStretch {
 		didSeek = true;
 		seekTimeFactor = (playbackRate*stft.defaultInterval() > 1) ? 1/playbackRate : stft.defaultInterval();
 	}
+	int seekLength() const {
+		return int(stft.blockSamples() + stft.defaultInterval());
+	}
 	
+	// Moves the input position *and* pre-calculates some output, so that the next samples returned from `.process()` are aligned to the beginning of the sample.
+	// The time-stretch rate is inferred from `inputLength`, so use `.outputSeekLength()` to get a correct value for that.
+	template<class Inputs>
+	void outputSeek(Inputs &&inputs, int inputLength) {
+		// TODO: add fade-out parameter to avoid clicks, instead of doing a full reset
+		reset();
+		// Assume we've been handed enough surplus input to produce `outputLatency()` samples of pre-roll
+		int surplusInput = std::max<int>(inputLength - inputLatency(), 0);
+		Sample playbackRate = surplusInput/Sample(outputLatency());
+
+		// Move the input position to the start of the sound
+		int seekSamples = inputLength - surplusInput;
+		seek(inputs, seekSamples, playbackRate);
+		
+		tmpPreRollBuffer.resize(outputLatency()*channels);
+		struct BufferOutput {
+			Sample *samples;
+			int length;
+			
+			Sample * operator[](int c) {
+				return samples + c*length;
+			}
+		} preRollOutput{tmpPreRollBuffer.data(), outputLatency()};
+		
+		// Use the surplus input to produce pre-roll output
+		OffsetIO<Inputs> offsetInput{inputs, seekSamples};
+		process(offsetInput, surplusInput, preRollOutput, preRollOutput.length);
+		
+		// put the thing down, flip it and reverse it
+		for (auto &v : tmpPreRollBuffer) v = -v;
+		for (int c = 0; c < channels; ++c) {
+			std::reverse(preRollOutput[c], preRollOutput[c] + preRollOutput.length);
+			stft.addOutput(c, preRollOutput.length, preRollOutput[c]);
+		}
+	}
+	int outputSeekLength(Sample playbackRate) const {
+		return inputLatency() + playbackRate*outputLatency();
+	}
+
 	template<class Inputs, class Outputs>
 	void process(Inputs &&inputs, int inputSamples, Outputs &&outputs, int outputSamples) {
 #ifdef SIGNALSMITH_STRETCH_PROFILE_PROCESS_START
@@ -165,14 +215,14 @@ struct SignalsmithStretch {
 		auto copyInput = [&](int toIndex){
 
 			int length = std::min<int>(int(stft.blockSamples() + stft.defaultInterval()), toIndex - prevCopiedInput);
-			tmpBuffer.resize(length);
+			tmpProcessBuffer.resize(length);
 			int offset = toIndex - length;
 			for (int c = 0; c < channels; ++c) {
 				auto &&inputBuffer = inputs[c];
 				for (int i = 0; i < length; ++i) {
-					tmpBuffer[i] = inputBuffer[i + offset];
+					tmpProcessBuffer[i] = inputBuffer[i + offset];
 				}
-				stft.writeInput(c, length, tmpBuffer.data());
+				stft.writeInput(c, length, tmpProcessBuffer.data());
 			}
 			stft.moveInput(length);
 			prevCopiedInput = toIndex;
@@ -193,7 +243,7 @@ struct SignalsmithStretch {
 					silenceFirst = false;
 					//stft.reset();
 					blockProcess = {};
-					for (auto &b : channelBands) {
+					for (auto &b : _channelBands) {
 						b.input = b.prevInput = b.output = 0;
 						b.inputEnergy = 0;
 					}
@@ -235,7 +285,7 @@ struct SignalsmithStretch {
 				blockProcess.samplesSinceLast = 0;
 				
 				// Time to process a spectrum!  Where should it come from in the input?
-				int inputOffset = std::round(outputIndex*Sample(inputSamples)/outputSamples);
+				int inputOffset = static_cast<int>(std::round(outputIndex*Sample(inputSamples)/outputSamples));
 				int inputInterval = inputOffset - prevInputOffset;
 				prevInputOffset = inputOffset;
 				
@@ -259,7 +309,7 @@ struct SignalsmithStretch {
 				
 				blockProcess.processFormants = formantMultiplier != 1 || (formantCompensation && blockProcess.mappedFrequencies);
 
-				blockProcess.timeFactor = didSeek ? seekTimeFactor : stft.defaultInterval()/std::max<Sample>(1, inputInterval);
+				blockProcess.timeFactor = didSeek ? seekTimeFactor : stft.defaultInterval()/static_cast<Sample>(std::max(1, inputInterval));
 				didSeek = false;
 
 				updateProcessSpectrumSteps();
@@ -271,7 +321,7 @@ struct SignalsmithStretch {
 			size_t processToStep = newBlock ? blockProcess.steps : 0;
 			if (_splitComputation) {
 				Sample processRatio = Sample(blockProcess.samplesSinceLast + 1)/stft.defaultInterval();
-				processToStep = std::min<size_t>(blockProcess.steps, (blockProcess.steps + 0.999f)*processRatio);
+				processToStep = std::min(blockProcess.steps, static_cast<size_t>((blockProcess.steps + 0.999f)*processRatio));
 			}
 			
 			while (blockProcess.step < processToStep) {
@@ -372,28 +422,38 @@ struct SignalsmithStretch {
 #endif
 	}
 
-	// Read the remaining output, providing no further input.  `outputSamples` should ideally be at least `.outputLatency()`
+	// Read the remaining output, providing no further input.  If `outputSamples` is more than one interval, it will compute additional blocks assuming a zero-valued input
 	template<class Outputs>
-	void flush(Outputs &&outputs, int outputSamples) {
-		int plainOutput = std::min<int>(outputSamples, int(stft.blockSamples()));
-		int foldedBackOutput = std::min<int>(outputSamples, int(stft.blockSamples()) - plainOutput);
+	void flush(Outputs &&outputs, int outputSamples, Sample playbackRate=0) {
+		struct Zeros {
+			struct Channel {
+				Sample operator[](int) {
+					return 0;
+				}
+			};
+			Channel operator[](int) {
+				return {};
+			}
+		} zeros;
+		// If we're asked for more than an interval of extra output, then zero-pad the input
+		int outputBlock = std::max<int>(0, outputSamples - stft.defaultInterval());
+		if (outputBlock > 0) process(zeros, outputBlock*playbackRate, outputs, outputBlock);
+
+		int tailSamples = outputSamples - outputBlock; // at most one interval
+		tmpProcessBuffer.resize(tailSamples);
 		stft.finishOutput(1);
 		for (int c = 0; c < channels; ++c) {
-			tmpBuffer.resize(plainOutput);
-			stft.readOutput(c, plainOutput, tmpBuffer.data());
+			stft.readOutput(c, tailSamples, tmpProcessBuffer.data());
 			auto &&outputChannel = outputs[c];
-			for (int i = 0; i < plainOutput; ++i) {
-				// TODO: plain output should be gain-
-				outputChannel[i] = tmpBuffer[i];
+			for (int i = 0; i < tailSamples; ++i) {
+				outputChannel[outputBlock + i] = tmpProcessBuffer[i];
 			}
-			tmpBuffer.resize(foldedBackOutput);
-			stft.readOutput(c, plainOutput, foldedBackOutput, tmpBuffer.data());
-			for (int i = 0; i < foldedBackOutput; ++i) {
-				outputChannel[outputSamples - 1 - i] -= tmpBuffer[i];
+			stft.readOutput(c, tailSamples, tailSamples, tmpProcessBuffer.data());
+			for (int i = 0; i < tailSamples; ++i) {
+				outputChannel[outputBlock + tailSamples - 1 - i] -= tmpProcessBuffer[i];
 			}
 		}
-		stft.reset(0.1);
-
+		stft.reset(0.1f);
 		// Reset the phase-vocoder stuff, so the next block gets a fresh start
 		for (int c = 0; c < channels; ++c) {
 			auto channelBands = bandsForChannel(c);
@@ -402,6 +462,34 @@ struct SignalsmithStretch {
 			}
 		}
 	}
+
+	// Process a complete audio buffer all in one go
+	template<class Inputs, class Outputs>
+	bool exact(Inputs &&inputs, int inputSamples, Outputs &&outputs, int outputSamples) {
+		Sample playbackRate = inputSamples/Sample(outputSamples);
+		auto seekLength = outputSeekLength(playbackRate);
+		if (inputSamples < seekLength) {
+			// to short for this - zero the output just to be polite
+			for (int c = 0; c < channels; ++c) {
+				auto &&channel = outputs[c];
+				for (int i = 0; i < outputSamples; ++i) {
+					channel[i] = 0;
+				}
+			}
+			return false;
+		}
+
+		outputSeek(inputs, seekLength);
+
+		int outputIndex = outputSamples - seekLength/playbackRate;
+		OffsetIO<Inputs> offsetInput{inputs, seekLength};
+		process(offsetInput, inputSamples - seekLength, outputs, outputIndex);
+		
+		OffsetIO<Outputs> offsetOutput{outputs, outputIndex};
+		flush(offsetOutput, outputSamples - outputIndex, playbackRate);
+		return true;
+	}
+
 private:
 	bool _splitComputation = false;
 	struct {
@@ -417,7 +505,7 @@ private:
 	} blockProcess;
 
 	using Complex = std::complex<Sample>;
-	static constexpr Sample noiseFloor{1e-15};
+	static constexpr Sample noiseFloor{Sample(1e-15)};
 	static constexpr Sample maxCleanStretch{2}; // time-stretch ratio before we start randomising phases
 	size_t silenceCounter = 0;
 	bool silenceFirst = true;
@@ -433,7 +521,7 @@ private:
 	typename STFT::Input stashedInput;
 	typename STFT::Output stashedOutput;
 	
-	std::vector<Sample> tmpBuffer;
+	std::vector<Sample> tmpProcessBuffer, tmpPreRollBuffer;
 
 	int channels = 0, bands = 0;
 	int prevInputOffset = -1;
@@ -452,14 +540,14 @@ private:
 		Complex output{0};
 		Sample inputEnergy;
 	};
-	std::vector<Band> channelBands;
+	std::vector<Band> _channelBands;
 	Band * bandsForChannel(int channel) {
-		return channelBands.data() + channel*bands;
+		return _channelBands.data() + channel*bands;
 	}
 	template<Complex Band::*member>
 	Complex getBand(int channel, int index) {
 		if (index < 0 || index >= bands) return 0;
-		return channelBands[index + channel*bands].*member;
+		return _channelBands[index + channel*bands].*member;
 	}
 	template<Complex Band::*member>
 	Complex getFractional(int channel, int lowIndex, Sample fractional) {
@@ -469,14 +557,14 @@ private:
 	}
 	template<Complex Band::*member>
 	Complex getFractional(int channel, Sample inputIndex) {
-		int lowIndex = std::floor(inputIndex);
+		int lowIndex = static_cast<int>(std::floor(inputIndex));
 		Sample fracIndex = inputIndex - lowIndex;
 		return getFractional<member>(channel, lowIndex, fracIndex);
 	}
 	template<Sample Band::*member>
 	Sample getBand(int channel, int index) {
 		if (index < 0 || index >= bands) return 0;
-		return channelBands[index + channel*bands].*member;
+		return _channelBands[index + channel*bands].*member;
 	}
 	template<Sample Band::*member>
 	Sample getFractional(int channel, int lowIndex, Sample fractional) {
@@ -546,7 +634,7 @@ private:
 		Sample timeFactor = blockProcess.timeFactor;
 		
 		Sample smoothingBins = Sample(stft.fftSamples())/stft.defaultInterval();
-		int longVerticalStep = std::round(smoothingBins);
+		int longVerticalStep = static_cast<int>(std::round(smoothingBins));
 		timeFactor = std::max<Sample>(timeFactor, 1/maxCleanStretch);
 		bool randomTimeFactor = (timeFactor > maxCleanStretch);
 		std::uniform_real_distribution<Sample> timeFactorDist(maxCleanStretch*2*randomTimeFactor - timeFactor, timeFactor);
@@ -612,7 +700,7 @@ private:
 			auto *predictions = predictionsForChannel(c);
 			for (int b = 0; b < bands; ++b) {
 				auto mapPoint = outputMap[b];
-				int lowIndex = std::floor(mapPoint.inputBin);
+				int lowIndex = static_cast<int>(std::floor(mapPoint.inputBin));
 				Sample fracIndex = mapPoint.inputBin - lowIndex;
 
 				Prediction &prediction = predictions[b];
@@ -717,7 +805,7 @@ private:
 
 		if (blockProcess.newSpectrum) {
 			if (step-- == 0) {
-				for (auto &bin : channelBands) {
+				for (auto &bin : _channelBands) {
 					bin.prevInput = bin.input;
 				}
 			}
@@ -799,7 +887,7 @@ private:
 			return;
 		}
 		Sample bottomOffset = peaks[0].input - peaks[0].output;
-		for (int b = 0; b < std::min<int>(bands, std::ceil(peaks[0].output)); ++b) {
+		for (int b = 0; b < std::min(bands, static_cast<int>(std::ceil(peaks[0].output))); ++b) {
 			outputMap[b] = {b + bottomOffset, 1};
 		}
 		// Interpolate between points
@@ -809,8 +897,8 @@ private:
 			Sample outOffset = prev.input - prev.output;
 			Sample outScale = next.input - next.output - prev.input + prev.output;
 			Sample gradScale = outScale*rangeScale;
-			int startBin = std::max<int>(0, std::ceil(prev.output));
-			int endBin = std::min<int>(bands, std::ceil(next.output));
+			int startBin = std::max(0, static_cast<int>(std::ceil(prev.output)));
+			int endBin = std::min(bands, static_cast<int>(std::ceil(next.output)));
 			for (int b = startBin; b < endBin; ++b) {
 				Sample r = (b - prev.output)*rangeScale;
 				Sample h = r*r*(3 - 2*r);
@@ -823,7 +911,7 @@ private:
 			}
 		}
 		Sample topOffset = peaks.back().input - peaks.back().output;
-		for (int b = std::max<int>(0, peaks.back().output); b < bands; ++b) {
+		for (int b = std::max(0, static_cast<int>(peaks.back().output)); b < bands; ++b) {
 			outputMap[b] = {b + topOffset, 1};
 		}
 	}
@@ -865,14 +953,14 @@ private:
 			int diff = std::abs(peakEstimate - peakIndices[1]);
 			if (diff > peakEstimate/8 && diff < peakEstimate*7/8) peakEstimate = peakEstimate%diff;
 			if (formantMetric[peakIndices[0]] > formantMetric[peakIndices[2]]*0.01) {
-				int diff = std::abs(peakEstimate - peakIndices[0]);
+				diff = std::abs(peakEstimate - peakIndices[0]);
 				if (diff > peakEstimate/8 && diff < peakEstimate*7/8) peakEstimate = peakEstimate%diff;
 			}
 		}
 		Sample weight = formantMetric[peakIndices[2]];
 		// Smooth it out a bit
-		freqEstimateWeighted += (peakEstimate*weight - freqEstimateWeighted)*0.25;
-		freqEstimateWeight += (weight - freqEstimateWeight)*0.25;
+		freqEstimateWeighted += (peakEstimate*weight - freqEstimateWeighted)*Sample(0.25);
+		freqEstimateWeight += (weight - freqEstimateWeight)*Sample(0.25);
 		
 		return freqEstimateWeighted/(freqEstimateWeight + Sample(1e-30));
 	}
@@ -893,27 +981,34 @@ private:
 
 			freqEstimate = freqToBand(formantBaseFreq);
 			if (formantBaseFreq <= 0) freqEstimate = estimateFrequency();
-
-			for (int b = 0; b < bands; ++b) {
-				formantMetric[b] = std::sqrt(formantMetric[b]);
-			}
 		} else if (step-- == 0) {
-			Sample slew = 1/(freqEstimate*0.5 + 1);
+			Sample decay = 1 - 1/(freqEstimate*Sample(0.5) + 1);
 			Sample e = 0;
 			for (size_t repeat = 0; repeat < 2; ++repeat) {
 				for (int b = bands - 1; b >= 0; --b) {
-					e += (formantMetric[b] - e)*slew;
+					e = std::max(formantMetric[b], e*decay);
 					formantMetric[b] = e;
 				}
 				for (int b = 0; b < bands; ++b) {
-					e += (formantMetric[b] - e)*slew;
+					e = std::max(formantMetric[b], e*decay);
+					formantMetric[b] = e;
+				}
+			}
+			decay = 1/decay;
+			for (size_t repeat = 0; repeat < 2; ++repeat) {
+				for (int b = bands - 1; b >= 0; --b) {
+					e = std::min(formantMetric[b], e*decay);
+					formantMetric[b] = e;
+				}
+				for (int b = 0; b < bands; ++b) {
+					e = std::min(formantMetric[b], e*decay);
 					formantMetric[b] = e;
 				}
 			}
 		} else {
 			auto getFormant = [&](Sample band) -> Sample {
 				if (band < 0) return 0;
-				band = std::min<Sample>(band, bands);
+				band = std::min(band, static_cast<Sample>(bands));
 				int floorBand = std::floor(band);
 				Sample fracBand = band - floorBand;
 				Sample low = formantMetric[floorBand], high = formantMetric[floorBand + 1];
@@ -921,7 +1016,7 @@ private:
 			};
 
 			for (int b = 0; b < bands; ++b) {
-				Sample inputF = bandToFreq(b);
+				Sample inputF = bandToFreq(static_cast<Sample>(b));
 				Sample outputF = formantCompensation ? mapFreq(inputF) : inputF;
 				outputF = invMapFormant(outputF);
 
@@ -929,7 +1024,7 @@ private:
 				Sample targetE = getFormant(freqToBand(outputF));
 
 				Sample formantRatio = targetE/(inputE + Sample(1e-30));
-				Sample energyRatio = formantRatio*formantRatio;
+				Sample energyRatio = formantRatio;
 
 				for (int c = 0; c < channels; ++c) {
 					Band *bins = bandsForChannel(c);
@@ -939,6 +1034,26 @@ private:
 			}
 		}
 	}
+
+	// Proxy class to avoid copying/allocating anything
+	template<class Io>
+	struct OffsetIO {
+		Io &io;
+		int offset;
+
+		struct Channel {
+			Io &io;
+			int channel;
+			int offset;
+			
+			auto operator[](int i) -> decltype(io[0][0]) {
+				return io[channel][i + offset];
+			}
+		};
+		Channel operator[](int c) {
+			return {io, c, offset};
+		}
+	};
 };
 
 }} // namespace
