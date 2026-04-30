@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
         .signalsmith_linear = .{
-            .path = "../lib-signalsmith-linear",
+            .url = "git+https://github.com/nat3Github/signalsmith-linear#f2d2f5b53e4a20fa34132a95d52f93977aa70902",
+            .hash = "signalsmith_linear-0.0.0-cK1dX5SnAgB3cdUoxpoHkn5LUxSH0RYUR2_LeKUCJtmY",
         },
     },
     .paths = .{
