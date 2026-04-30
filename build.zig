@@ -46,8 +46,6 @@ pub fn build(b: *std.Build) void {
     // });
 
     const test_c = b.addTest(.{
-        .optimize = optimize,
-        .target = target,
         .root_module = module,
     });
 
